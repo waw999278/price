@@ -11,7 +11,8 @@ from .config import Config
 from .parsing import store_label
 
 log = logging.getLogger("notifier")
-SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£"}
+SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£", "NGN": "₦", "KES": "KSh", "EGP": "E£",
+           "MAD": "MAD", "GHS": "GH₵", "XOF": "FCFA"}
 
 
 def money(value: float, currency: str | None) -> str:

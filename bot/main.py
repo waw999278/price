@@ -7,6 +7,7 @@ import os
 import signal
 from datetime import timedelta
 
+from .autosources import hub_urls, normalize_candidate, score_link
 from .config import load
 from .db import DB, now
 from .detector import evaluate, evaluate_listing
@@ -27,6 +28,8 @@ class App:
         self.scraper = Scraper(self.cfg, on_pause=self._on_pause)
         self.sem = asyncio.Semaphore(self.cfg.concurrency)
         self.running: set[int] = set()
+        self._refresh_lock = asyncio.Lock()
+        self._bg: set[asyncio.Task] = set()
 
     # ---------- utilitaires ----------
     async def _on_pause(self, key: str, minutes: int):
@@ -243,6 +246,81 @@ class App:
                     asyncio.create_task(self._source_worker(s))
             await asyncio.sleep(20)
 
+    # ---------- découverte AUTOMATIQUE des pages sources ----------
+    async def refresh_sources(self) -> dict[str, int]:
+        """Explore les sites (SITES), repère les pages de promos/catégories, les vérifie
+        (>= AUTO_MIN_ITEMS produits) et les enregistre comme sources automatiques."""
+        async with self._refresh_lock:
+            cfg = self.cfg
+            added: dict[str, int] = {}
+            for host in cfg.sites:
+                key = store_key(host)
+                if key not in STORES:
+                    log.warning("SITES : %s n'est pas géré", host)
+                    continue
+                scored: dict[str, int] = {}
+                for hub in hub_urls(host):
+                    try:
+                        links = await self.scraper.fetch_links(hub)
+                    except (BlockedError, ScrapeError) as e:
+                        log.warning("exploration %s : %s", hub, e)
+                        continue
+                    for link in links:
+                        href = normalize_candidate(link.href)
+                        score = score_link(href, link.text, host)
+                        if score > 0:
+                            scored[href] = max(scored.get(href, 0), score)
+
+                ranked = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
+                have = self.db.count_auto_sources(key)
+                for url, score in ranked[: cfg.auto_candidates]:
+                    if have >= cfg.auto_max_sources:
+                        break
+                    if self.db.has_source(url) or self.db.candidate_recent(url):
+                        continue
+                    try:
+                        items = await self.scraper.fetch_listing(url)
+                    except (BlockedError, ScrapeError):
+                        continue                      # on réessaiera à la prochaine exploration
+                    if len(items) >= cfg.auto_min_items:
+                        self.db.add_source(url, key, auto=True)
+                        self.db.candidate_set(url, key, "accepted", len(items))
+                        have += 1
+                        added[key] = added.get(key, 0) + 1
+                        log.info("source auto : %s (%d produits, score %d)", url[:70],
+                                 len(items), score)
+                    else:
+                        self.db.candidate_set(url, key, "rejected", len(items))
+
+            removed = self.db.deactivate_weak_auto(5)
+            if added or removed:
+                parts = [f"+{n} {k}" for k, n in added.items()]
+                await self.notifier.send_admin(
+                    "🤖 Pages sources auto : " + (", ".join(parts) or "aucune nouvelle")
+                    + (f" • {removed} retirée(s) (trop peu de produits)" if removed else ""))
+            return added
+
+    def trigger_refresh(self) -> bool:
+        """Lance une exploration en arrière-plan (commande /prix auto)."""
+        if self._refresh_lock.locked() or not self.cfg.sites:
+            return False
+        task = asyncio.create_task(self.refresh_sources())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        task.add_done_callback(self._log_task)
+        return True
+
+    async def autodiscover_loop(self):
+        await asyncio.sleep(30)           # laisse le navigateur et les contrôles démarrer
+        while True:
+            try:
+                await self.refresh_sources()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("erreur pendant l'exploration automatique")
+            await asyncio.sleep(self.cfg.auto_refresh)
+
     async def _worker(self, p):
         try:
             await self.process(p)
@@ -278,6 +356,8 @@ class App:
         tasks = [asyncio.create_task(self.scheduler()),
                  asyncio.create_task(self.source_scheduler()),
                  asyncio.create_task(self.heartbeat())]
+        if self.cfg.sites and self.cfg.auto_enabled:
+            tasks.append(asyncio.create_task(self.autodiscover_loop()))
         if self.cfg.discord_token:
             from .commands import build_client
             client = build_client(self)

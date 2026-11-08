@@ -16,6 +16,7 @@ from .parsing import (
     LINK_PATTERNS,
     SELECTORS,
     Item,
+    Link,
     Parsed,
     looks_blocked,
     parse_listing_items,
@@ -118,6 +119,24 @@ JS_COUNT = """(link) => {
   });
   return keys.size;
 }"""
+# Tous les liens internes d'une page (pour trouver les pages de promos et de catégories).
+JS_LINKS = """() => {
+  const out = [], seen = new Set();
+  for (const a of document.querySelectorAll('a[href]')) {
+    let u;
+    try { u = new URL(a.href); } catch (e) { continue; }
+    if (u.hostname !== location.hostname) continue;
+    u.hash = '';
+    const h = u.toString();
+    if (seen.has(h)) continue;
+    seen.add(h);
+    const t = (a.innerText || a.getAttribute('aria-label') || a.title || '').trim();
+    out.push({ href: h, text: t.slice(0, 80) });
+    if (out.length >= 2000) break;
+  }
+  return { links: out, title: document.title,
+           text: (document.body ? document.body.innerText : '').slice(0, 4000) };
+}"""
 JS_HAS_LINKS = JS_COUNT.replace("return keys.size;", "return keys.size > 0;")
 
 # Pubs / analytics : inutiles pour lire un prix. On ne bloque PAS les scripts anti-bot
@@ -150,7 +169,8 @@ class Scraper:
         self.cfg = cfg
         self.on_pause = on_pause           # async callback(key, minutes)
         self._pw = None
-        self._ctx = None
+        self._ctxs: dict[bool, object] = {}         # False = direct, True = via proxy
+        self._open_lock = asyncio.Lock()
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, float] = {}
         self._fails: dict[str, int] = {}
@@ -166,11 +186,17 @@ class Scraper:
     # --- cycle de vie ---
     async def start(self):
         self._pw = await async_playwright().start()
-        await self._open()
 
-    async def _open(self):
+    def _use_proxy(self, key: str) -> bool:
+        """Proxy seulement pour les boutiques de PROXY_SITES (vide = toutes)."""
+        if not self.cfg.proxy:
+            return False
+        return not self.cfg.proxy_sites or key in self.cfg.proxy_sites
+
+    async def _open(self, use_proxy: bool):
         opts = dict(
-            user_data_dir=os.path.join(self.cfg.data_dir, "profile"),
+            user_data_dir=os.path.join(self.cfg.data_dir,
+                                       "profile-proxy" if use_proxy else "profile"),
             headless=self.cfg.headless,
             user_agent=USER_AGENT,
             locale="fr-FR",
@@ -179,13 +205,24 @@ class Scraper:
             args=["--no-sandbox", "--disable-dev-shm-usage",
                   "--disable-blink-features=AutomationControlled"],
         )
-        if self.cfg.proxy:
+        if use_proxy:
             opts["proxy"] = self.cfg.proxy
-        self._ctx = await self._pw.chromium.launch_persistent_context(**opts)
-        await self._ctx.add_init_script(
+        ctx = await self._pw.chromium.launch_persistent_context(**opts)
+        await ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         if self.cfg.block_media or self.cfg.block_trackers:
-            await self._ctx.route("**/*", self._route)
+            await ctx.route("**/*", self._route)
+        return ctx
+
+    async def _get_ctx(self, key: str):
+        use = self._use_proxy(key)
+        async with self._open_lock:                 # évite d'ouvrir 2 fois le même profil
+            if use not in self._ctxs:
+                self._ctxs[use] = await self._open(use)
+            return self._ctxs[use]
+
+    async def _new_page(self, key: str):
+        return await (await self._get_ctx(key)).new_page()
 
     async def _route(self, route):
         req = route.request
@@ -198,18 +235,21 @@ class Scraper:
         except PlaywrightError:
             pass        # page déjà fermée
 
+    async def _close_all(self):
+        for ctx in list(self._ctxs.values()):
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        self._ctxs.clear()
+
     async def _restart(self):
         log.info("recyclage du navigateur (libère la mémoire)")
-        try:
-            await self._ctx.close()
-        except Exception:
-            pass
-        await self._open()
+        await self._close_all()                    # les contextes se rouvrent à la demande
 
     async def stop(self):
         try:
-            if self._ctx:
-                await self._ctx.close()
+            await self._close_all()
         finally:
             if self._pw:
                 await self._pw.stop()
@@ -294,6 +334,10 @@ class Scraper:
         key = store_key(url)
         return await self._guarded(key, lambda: self._listing_once(url, key))
 
+    async def fetch_links(self, url: str) -> list[Link]:
+        key = store_key(url)
+        return await self._guarded(key, lambda: self._links_once(url, key))
+
     async def _register_block(self, key: str):
         n = self._fails[key] = self._fails.get(key, 0) + 1
         if n >= BLOCK_LIMIT:
@@ -309,7 +353,7 @@ class Scraper:
             raise BlockedError(f"HTTP {resp.status}")
 
     async def _fetch_once(self, url: str, key: str) -> Parsed:
-        page = await self._ctx.new_page()
+        page = await self._new_page(key)
         try:
             await self._goto(page, url)
             sel = SELECTORS.get(key, {})
@@ -337,7 +381,7 @@ class Scraper:
         link = LINK_PATTERNS.get(key)
         if not link:
             raise ScrapeError(f"site non géré : {key}")
-        page = await self._ctx.new_page()
+        page = await self._new_page(key)
         try:
             await self._goto(page, url)
             try:     # attend l'apparition des premiers produits
@@ -367,6 +411,26 @@ class Scraper:
         if not items and looks_blocked(data):
             raise BlockedError("captcha / page de vérification")
         return items[:300]
+
+    async def _links_once(self, url: str, key: str) -> list[Link]:
+        page = await self._new_page(key)
+        try:
+            await self._goto(page, url)
+            await page.wait_for_timeout(2500)
+            await page.mouse.wheel(0, 1200)
+            await page.wait_for_timeout(800)
+            data = await page.evaluate(JS_LINKS)
+        except PlaywrightTimeout as e:
+            raise ScrapeError("timeout") from e
+        except PlaywrightError as e:
+            await self._on_pw_error(e)
+            raise ScrapeError(str(e)[:200]) from e
+        finally:
+            await self._close(page)
+        links = [Link(x["href"], x.get("text", "")) for x in data.get("links") or []]
+        if not links and looks_blocked(data):
+            raise BlockedError("captcha / page de vérification")
+        return links
 
     async def _on_pw_error(self, e: Exception):
         if "closed" in str(e).lower():

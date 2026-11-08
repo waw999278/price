@@ -107,10 +107,22 @@ def build_client(app) -> discord.Client:
             rows = db.list_sources()
             if not rows:
                 return await i.response.send_message("Aucune source.", ephemeral=True)
-            lines = [f"{'🟢' if s.active else '⚫'} {store_label(s.url)[0]} • "
+            lines = [f"{'🟢' if s.active else '⚫'}{'🤖' if s.auto else ''} "
+                     f"{store_label(s.url)[0]} • "
                      f"{s.last_items if s.last_items is not None else '?'} produits • {s.url[:70]}"
                      for s in rows[:30]]
             await i.response.send_message("\n".join(lines), ephemeral=True)
+
+        @group.command(name="auto",
+                       description="Chercher maintenant de nouvelles pages à scanner")
+        async def auto(i: discord.Interaction):
+            if not cfg.sites:
+                return await i.response.send_message(
+                    "Aucun site configuré : ajoute la variable SITES.", ephemeral=True)
+            started = app.trigger_refresh()
+            await i.response.send_message(
+                "🤖 Exploration lancée, résultat dans quelques minutes (/prix source_list)."
+                if started else "⏳ Une exploration est déjà en cours.", ephemeral=True)
 
         @group.command(name="status", description="État du bot")
         async def status(i: discord.Interaction):

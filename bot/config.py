@@ -5,6 +5,26 @@ import os
 from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
+from .autosources import normalize_host
+from .parsing import store_key
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Lit un fichier .env (NOM=valeur) sans dépendance. Les vraies variables d'environnement
+    (ex. Railway) restent prioritaires."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8-sig") as f:       # utf-8-sig : tolère le Bloc-notes Windows
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ.setdefault(key.strip(), value)
+
 
 def _env(name: str, default: str | None = None) -> str | None:
     v = os.environ.get(name)
@@ -55,9 +75,17 @@ class Config:
     ready_timeout: float       # attente max (s) que le prix apparaisse dans la page
     block_trackers: bool       # bloquer pubs / analytics
     restart_every: int         # recycler Chromium toutes les N pages
+    sites: tuple               # sites explorés pour trouver des pages sources
+    auto_enabled: bool
+    auto_candidates: int       # pages candidates vérifiées par site et par exploration
+    auto_max_sources: int      # sources automatiques max par boutique
+    auto_min_items: int        # produits minimum pour qu'une page soit retenue
+    auto_refresh: int          # secondes entre deux explorations
+    proxy_sites: frozenset     # boutiques qui passent par le proxy (vide = toutes)
 
 
 def load() -> Config:
+    load_dotenv()
     webhook = _env("DISCORD_WEBHOOK")
     if not webhook:
         raise SystemExit("DISCORD_WEBHOOK manquant")
@@ -96,4 +124,12 @@ def load() -> Config:
         ready_timeout=float(_env("READY_TIMEOUT_SEC", "8")),
         block_trackers=_env("BLOCK_TRACKERS", "1") != "0",
         restart_every=int(_env("RESTART_EVERY_PAGES", "300")),
+        sites=tuple(normalize_host(h) for h in (_env("SITES", "") or "").replace(",", " ").split()),
+        auto_enabled=_env("AUTO_SOURCES", "1") != "0",
+        auto_candidates=int(_env("AUTO_CANDIDATES", "12")),
+        auto_max_sources=int(_env("AUTO_MAX_SOURCES", "8")),
+        auto_min_items=int(_env("AUTO_MIN_ITEMS", "15")),
+        auto_refresh=int(float(_env("AUTO_REFRESH_HOURS", "12")) * 3600),
+        proxy_sites=frozenset(
+            store_key(t) for t in (_env("PROXY_SITES", "") or "").replace(",", " ").split()),
     )

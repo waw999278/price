@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS alerts(
 CREATE TABLE IF NOT EXISTS sources(
   id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, store TEXT, active INTEGER DEFAULT 1,
   added_at TEXT, next_check TEXT, last_items INTEGER, fail_count INTEGER DEFAULT 0,
-  last_found TEXT);
+  last_found TEXT, auto INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS listing_prices(
   id INTEGER PRIMARY KEY, url TEXT NOT NULL, price REAL NOT NULL, old_price REAL,
   anomaly INTEGER DEFAULT 0, ts TEXT NOT NULL);
@@ -28,6 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_listing ON listing_prices(url, id);
 CREATE TABLE IF NOT EXISTS discovery_alerts(
   id INTEGER PRIMARY KEY, url TEXT NOT NULL, price REAL NOT NULL, ts TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_disc ON discovery_alerts(url, id);
+CREATE TABLE IF NOT EXISTS source_candidates(
+  url TEXT PRIMARY KEY, store TEXT, status TEXT, items INTEGER, ts TEXT NOT NULL);
 """
 
 
@@ -62,6 +64,7 @@ class Source:
     last_items: int | None
     fail_count: int
     last_found: datetime | None = None
+    auto: bool = False
 
 
 class DB:
@@ -70,10 +73,11 @@ class DB:
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript(SCHEMA)
-        try:    # migration des bases créées avant l'ajout de la colonne
-            self.con.execute("ALTER TABLE sources ADD COLUMN last_found TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for col in ("last_found TEXT", "auto INTEGER DEFAULT 0"):   # migration des anciennes bases
+            try:
+                self.con.execute(f"ALTER TABLE sources ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
 
     @staticmethod
     def _p(r: sqlite3.Row) -> Product:
@@ -195,6 +199,8 @@ class DB:
         self.con.execute("DELETE FROM prices WHERE ts < ?", (iso(now() - timedelta(days=days)),))
         self.con.execute("DELETE FROM listing_prices WHERE ts < ?",
                          (iso(now() - timedelta(days=7)),))
+        self.con.execute("DELETE FROM source_candidates WHERE ts < ?",
+                         (iso(now() - timedelta(days=30)),))
         self.con.execute("DELETE FROM discovery_alerts WHERE ts < ?",
                          (iso(now() - timedelta(days=30)),))
         self.con.commit()
@@ -204,14 +210,15 @@ class DB:
     def _s(r: sqlite3.Row) -> Source:
         found = datetime.fromisoformat(r["last_found"]) if r["last_found"] else None
         return Source(r["id"], r["url"], r["store"], bool(r["active"]), r["last_items"],
-                      r["fail_count"], found)
+                      r["fail_count"], found, bool(r["auto"]))
 
-    def add_source(self, url, store) -> bool:
+    def add_source(self, url, store, auto=False) -> bool:
         exists = self.con.execute("SELECT 1 FROM sources WHERE url=?", (url,)).fetchone()
         self.con.execute(
-            """INSERT INTO sources(url, store, added_at) VALUES(?,?,?)
-               ON CONFLICT(url) DO UPDATE SET active=1, fail_count=0, next_check=NULL""",
-            (url, store, iso(now())))
+            """INSERT INTO sources(url, store, added_at, auto) VALUES(?,?,?,?)
+               ON CONFLICT(url) DO UPDATE SET active=1, fail_count=0, next_check=NULL,
+                 auto=CASE WHEN excluded.auto=0 THEN 0 ELSE auto END""",
+            (url, store, iso(now()), int(auto)))
         self.con.commit()
         return not exists
 
@@ -286,3 +293,30 @@ class DB:
 
     def commit(self):
         self.con.commit()
+
+    # --- découverte automatique ---
+    def has_source(self, url: str) -> bool:
+        return bool(self.con.execute("SELECT 1 FROM sources WHERE url=?", (url,)).fetchone())
+
+    def count_auto_sources(self, store: str) -> int:
+        return self.con.execute(
+            "SELECT COUNT(*) FROM sources WHERE auto=1 AND active=1 AND store=?",
+            (store,)).fetchone()[0]
+
+    def candidate_recent(self, url: str, days: int = 7) -> bool:
+        r = self.con.execute("SELECT ts FROM source_candidates WHERE url=?", (url,)).fetchone()
+        return bool(r) and (now() - datetime.fromisoformat(r["ts"])).days < days
+
+    def candidate_set(self, url, store, status, items):
+        self.con.execute(
+            """INSERT INTO source_candidates(url, store, status, items, ts) VALUES(?,?,?,?,?)
+               ON CONFLICT(url) DO UPDATE SET status=excluded.status, items=excluded.items,
+                 ts=excluded.ts""", (url, store, status, items, iso(now())))
+        self.con.commit()
+
+    def deactivate_weak_auto(self, min_items: int) -> int:
+        cur = self.con.execute(
+            "UPDATE sources SET active=0 WHERE auto=1 AND active=1 "
+            "AND last_items IS NOT NULL AND last_items < ?", (min_items,))
+        self.con.commit()
+        return cur.rowcount

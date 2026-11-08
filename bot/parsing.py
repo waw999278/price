@@ -11,9 +11,12 @@ STORES = {
     "cdiscount": "Cdiscount",
     "aliexpress": "AliExpress",
     "alibaba": "Alibaba",
+    "jumia": "Jumia",
 }
 TLD_FLAGS = {"fr": "🇫🇷", "com": "🇺🇸", "de": "🇩🇪", "es": "🇪🇸", "it": "🇮🇹", "uk": "🇬🇧",
-             "nl": "🇳🇱", "be": "🇧🇪"}
+             "nl": "🇳🇱", "be": "🇧🇪",
+             "ng": "🇳🇬", "eg": "🇪🇬", "ke": "🇰🇪", "ma": "🇲🇦", "gh": "🇬🇭", "sn": "🇸🇳",
+             "ci": "🇨🇮", "tn": "🇹🇳", "dz": "🇩🇿", "ug": "🇺🇬"}
 
 # Sélecteurs de secours (JSON-LD et meta tags passent en premier). À ajuster si le site change.
 SELECTORS = {
@@ -36,6 +39,11 @@ SELECTORS = {
         "title": ["h1"],
         "img": [],
     },
+    "jumia": {
+        "price": ["span.-b.-fs24", "[class*='-fs24']", "[class*='-b'][class*='-ubpt']"],
+        "title": ["h1"],
+        "img": [],
+    },
     "cdiscount": {
         "price": ["[itemprop='price']", ".fpPrice", ".price"],
         "title": ["h1"],
@@ -49,6 +57,7 @@ LINK_PATTERNS = {
     "cdiscount": r"/f-\d+-[^/?#]+\.html",
     "aliexpress": r"/item/\d+\.html",
     "alibaba": r"/product-detail/[^/?#]+\.html",
+    "jumia": r"/[^/?#]+-\d{5,}\.html",
 }
 
 BLOCK_HINTS = (
@@ -68,7 +77,8 @@ class Parsed:
 
 
 def store_key(url: str) -> str:
-    host = urlparse(url).netloc.lower()
+    """Clé de boutique pour une URL ou un simple nom d'hôte (ex. 'www.amazon.fr')."""
+    host = (urlparse(url).netloc or urlparse("//" + url).netloc).lower()
     for k in STORES:
         if k in host:
             return k
@@ -136,6 +146,10 @@ def guess_currency(text: str | None) -> str | None:
     if not text:
         return None
     for sym, cur in (("€", "EUR"), ("EUR", "EUR"), ("£", "GBP"), ("GBP", "GBP"),
+                     ("₦", "NGN"), ("NGN", "NGN"), ("KSh", "KES"), ("Ksh", "KES"),
+                     ("KES", "KES"), ("EGP", "EGP"), ("E£", "EGP"), ("MAD", "MAD"),
+                     ("Dhs", "MAD"), ("DH", "MAD"), ("GH₵", "GHS"), ("GHS", "GHS"),
+                     ("FCFA", "XOF"), ("XOF", "XOF"),
                      ("US", "USD"), ("$", "USD"), ("USD", "USD")):
         if sym in text:
             return cur
@@ -227,8 +241,10 @@ class Item:
 
 
 _AMT = r"(\d[\d \u00a0\u202f.,]*\d|\d)"
-_CUR = r"(?:€|£|US ?\$|\$|EUR|USD|GBP)"
-_PRICE_RE = re.compile(rf"(?:({_CUR})\s?{_AMT})|(?:{_AMT}\s?({_CUR}))")
+_CUR = (r"(?:€|£|US ?\$|\$|EUR|USD|GBP|₦|NGN|KSh|Ksh|KES|EGP|E£|MAD|Dhs|DH|GH₵|GHS|"
+        r"FCFA|XOF)")
+_SP = r"[ \u00a0\u202f]?"          # espace sur la MÊME ligne (jamais un saut de ligne)
+_PRICE_RE = re.compile(rf"(?:({_CUR}){_SP}{_AMT})|(?:{_AMT}{_SP}({_CUR}))")
 _NOISE_AFTER = re.compile(
     r"^\s*(?:/|par |de |d')?\s*(?:mois|mo\b|month|livr|ship|frais|port|kg|l\b|100|unit)", re.I)
 _NOISE_BEFORE = re.compile(r"\d\s?[x×]\s*$", re.I)
@@ -270,6 +286,12 @@ def parse_listing_items(raw_items: list[dict]) -> list[Item]:
         items.append(Item(url=href, name=" ".join(str(r.get("title") or "").split())[:250],
                           price=price, old_price=old, currency=cur, image=r.get("img") or None))
     return items
+
+
+@dataclass
+class Link:
+    href: str
+    text: str = ""
 
 
 def clean_source_url(url: str) -> str:
